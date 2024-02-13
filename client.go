@@ -1,21 +1,24 @@
 // Package vnc implements a VNC client.
 //
 // References:
-//   [PROTOCOL]: http://tools.ietf.org/html/rfc6143
+//
+//	[PROTOCOL]: http://tools.ietf.org/html/rfc6143
 package vnc
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"time"
 	"unicode"
 )
 
 type ClientConn struct {
 	c      net.Conn
-	config *ClientConfig
+	config *HardClientConfig
 
 	// If the pixel format uses a color map, then this is the color
 	// map that is used. This should not be modified directly, since
@@ -39,11 +42,14 @@ type ClientConn struct {
 	// be modified. If you wish to set a new pixel format, use the
 	// SetPixelFormat method.
 	PixelFormat PixelFormat
+
+	// A slice of supported messages that can be read from the server.
+	ServerMessageCh *chan<- ServerMessage
 }
 
 // A ClientConfig structure is used to configure a ClientConn. After
 // one has been passed to initialize a connection, it must not be modified.
-type ClientConfig struct {
+type HardClientConfig struct {
 	// A slice of ClientAuth methods. Only the first instance that is
 	// suitable by the server will be used to authenticate.
 	Auth []ClientAuth
@@ -66,11 +72,98 @@ type ClientConfig struct {
 	ServerMessages []ServerMessage
 }
 
-func Client(c net.Conn, cfg *ClientConfig) (*ClientConn, error) {
+// A ClientConfig structure is used to configure a ClientConn. After
+// one has been passed to initialize a connection, it must not be modified.
+type ClientConfig struct {
+	// Exclusive determines whether the connection is shared with other
+	// clients. If true, then all other clients connected will be
+	// disconnected when a connection is established to the VNC server.
+	Exclusive bool
+
+	//Timeout is the maximum amount of time a dial will wait for a connect to complete.
+	//The default is no timeout.
+	//With or without a timeout, the operating system may impose its own earlier timeout. For instance, TCP timeouts are often around 3 minutes.
+	Timeout time.Duration
+
+	//Deadline is the absolute point in time after which dials will fail. If Timeout is set, it may fail earlier. Zero means no deadline, or dependent on the operating system as with the Timeout option.
+	Deadline time.Time
+
+	//The password of the VNC server
+	//If password is empty will not try to authenticate
+	Password string
+
+	//If is true will try using a TLS connection
+	TLS bool
+
+	//Configuration for the TLS connection
+	//If a TCP connection is used, this propety is ignored
+	TLSConfig tls.Config
+}
+
+func Client(host string, cfg *ClientConfig) (*ClientConn, error) {
+
+	var err error
+	var nc net.Conn
+
+	if cfg.TLS {
+
+		dialer := &net.Dialer{
+			Timeout: cfg.Timeout,
+		}
+
+		nc, err = tls.DialWithDialer(dialer, "tcp", host, &cfg.TLSConfig)
+	} else {
+		if cfg.Timeout == 0 {
+			nc, err = net.Dial("tcp", host)
+		} else {
+			nc, err = net.DialTimeout("tcp", host, cfg.Timeout)
+		}
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if err := nc.SetDeadline(cfg.Deadline); err != nil {
+		return nil, err
+	}
+
+	ch := make(chan ServerMessage)
+
+	cltConfig := HardClientConfig{
+		Exclusive:       cfg.Exclusive,
+		ServerMessageCh: ch,
+		ServerMessages:  []ServerMessage{new(FramebufferUpdateMessage)},
+	}
+
+	if cfg.Password != "" {
+		cltConfig.Auth = []ClientAuth{&PasswordAuth{Password: cfg.Password}}
+	}
+
+	conn := &ClientConn{
+		c:      nc,
+		config: &cltConfig,
+	}
+
+	conn.ServerMessageCh = &conn.config.ServerMessageCh
+
+	if err := conn.handshake(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	go conn.mainLoop()
+
+	return conn, nil
+}
+
+func HardClient(c net.Conn, cfg *HardClientConfig) (*ClientConn, error) {
 	conn := &ClientConn{
 		c:      c,
 		config: cfg,
 	}
+
+	conn.ServerMessageCh = &conn.config.ServerMessageCh
 
 	if err := conn.handshake(); err != nil {
 		conn.Close()
